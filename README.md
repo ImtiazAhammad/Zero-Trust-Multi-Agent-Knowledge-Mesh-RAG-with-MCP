@@ -91,7 +91,7 @@ zero-trust-rag/
 
 ### 1. Clone & Initialize Environment
 ```bash
-git clone <your-repo-url> zero-trust-rag
+git clone https://github.com/ImtiazAhammad/Zero-Trust-Multi-Agent-Knowledge-Mesh-RAG-with-MCP.git
 cd zero-trust-rag
 cp .env.example .env
 ```

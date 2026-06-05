@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -7,23 +5,23 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_DB: zerotrustrag
+      POSTGRES_DB: rag_db
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./vector_db/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d zerotrustrag"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rag_db"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
-    image: redis/redis-stack:latest
+    image: redis:7-alpine
     container_name: zero-trust-redis
     ports:
       - "6379:6379"
-      - "8001:8001" # RedisInsight UI
     volumes:
       - redis_data:/data
     healthcheck:
@@ -31,6 +29,44 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: zero-trust-vllm
+    ports:
+      - "8001:8000"
+    volumes:
+      # Share Hugging Face cache with the host to avoid redownloading models
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    # Configure for Qwen2.5-7B AWQ quantization to run efficiently on 16GB VRAM
+    command: [
+      "--model", "Qwen/Qwen2.5-7B-Instruct-AWQ",
+      "--quantization", "awq",
+      "--max-model-len", "4096",
+      "--gpu-memory-utilization", "0.85"
+    ]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  embedding-service:
+    build:
+      context: ./embedding_service
+      dockerfile: Dockerfile
+    container_name: zero-trust-embeddings
+    ports:
+      - "8002:8000"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 volumes:
   postgres_data:

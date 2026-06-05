@@ -1,53 +1,47 @@
 import os
+import requests
 from typing import List
 from dotenv import load_dotenv
 
 load_dotenv()
 
 MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-large-en-v1.5")
-
-# Initialize embedding model lazily
-_model = None
-
-def get_embedding_model():
-    global _model
-    if _model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            print(f"Loading embedding model: {MODEL_NAME}...")
-            _model = SentenceTransformer(MODEL_NAME)
-        except Exception as e:
-            print(f"Failed to load sentence-transformers model '{MODEL_NAME}': {e}")
-            print("Falling back to mock embeddings (1024-dimensional dummy vectors).")
-            _model = "mock"
-    return _model
+EMBEDDING_SERVICE_URL = os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8002")
 
 def get_embedding(text: str) -> List[float]:
     """
     Generates a dense vector embedding for the given text.
-    For BAAI/bge-large-en-v1.5, the dimension is 1024.
+    Queries the BGE embedding microservice, falling back to deterministic mock embeddings on failure.
     """
-    model = get_embedding_model()
-    if model == "mock":
+    try:
+        response = requests.post(
+            f"{EMBEDDING_SERVICE_URL}/embed", 
+            json={"texts": [text]}, 
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json()["embeddings"][0]
+    except Exception as e:
+        print(f"Embedding service call failed ({e}). Falling back to mock local vectors.")
         # Return a deterministic mock vector of size 1024 based on hash of text
         import random
-        # Seed generator with hash of text for consistent embeddings of same string
-        h = hash(text)
-        random.seed(h)
-        mock_vec = [random.uniform(-0.1, 0.1) for _ in range(1024)]
-        return mock_vec
-    
-    # Generate actual embedding
-    embedding = model.encode(text, normalize_embeddings=True)
-    return embedding.tolist()
+        random.seed(hash(text))
+        return [random.uniform(-0.1, 0.1) for _ in range(1024)]
 
 def get_embeddings(texts: List[str]) -> List[List[float]]:
     """
-    Generates dense embeddings for a list of texts.
+    Generates dense embeddings for a list of texts by calling the BGE microservice.
     """
-    model = get_embedding_model()
-    if model == "mock":
+    if not texts:
+        return []
+    try:
+        response = requests.post(
+            f"{EMBEDDING_SERVICE_URL}/embed", 
+            json={"texts": texts}, 
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()["embeddings"]
+    except Exception as e:
+        print(f"Embedding service batch call failed ({e}). Falling back to mock local vectors.")
         return [get_embedding(t) for t in texts]
-        
-    embeddings = model.encode(texts, normalize_embeddings=True)
-    return embeddings.tolist()

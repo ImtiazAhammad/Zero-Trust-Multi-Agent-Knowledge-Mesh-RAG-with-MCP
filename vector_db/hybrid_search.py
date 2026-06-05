@@ -39,7 +39,7 @@ async def run_dense_query(conn: asyncpg.Connection, query_vector: List[float], d
     vector_str = str(query_vector)
     if source:
         sql = """
-            SELECT id, content, source, 1 - (embedding <=> $1::vector) AS score 
+            SELECT id, title, content, source, 1 - (embedding <=> $1::vector) AS score 
             FROM documents 
             WHERE department = $2 AND clearance_level <= $3 AND source = $4
             ORDER BY score DESC LIMIT 20
@@ -47,7 +47,7 @@ async def run_dense_query(conn: asyncpg.Connection, query_vector: List[float], d
         return await conn.fetch(sql, vector_str, department, clearance_level, source)
     else:
         sql = """
-            SELECT id, content, source, 1 - (embedding <=> $1::vector) AS score 
+            SELECT id, title, content, source, 1 - (embedding <=> $1::vector) AS score 
             FROM documents 
             WHERE department = $2 AND clearance_level <= $3
             ORDER BY score DESC LIMIT 20
@@ -60,7 +60,7 @@ async def run_sparse_query(conn: asyncpg.Connection, query: str, department: str
     """
     if source:
         sql = """
-            SELECT id, content, source, ts_rank_cd(to_tsvector('english', content), plainto_tsquery($1)) AS score 
+            SELECT id, title, content, source, ts_rank_cd(to_tsvector('english', content), plainto_tsquery($1)) AS score 
             FROM documents 
             WHERE department = $2 AND clearance_level <= $3 AND source = $4
             ORDER BY score DESC LIMIT 20
@@ -68,7 +68,7 @@ async def run_sparse_query(conn: asyncpg.Connection, query: str, department: str
         return await conn.fetch(sql, query, department, clearance_level, source)
     else:
         sql = """
-            SELECT id, content, source, ts_rank_cd(to_tsvector('english', content), plainto_tsquery($1)) AS score 
+            SELECT id, title, content, source, ts_rank_cd(to_tsvector('english', content), plainto_tsquery($1)) AS score 
             FROM documents 
             WHERE department = $2 AND clearance_level <= $3
             ORDER BY score DESC LIMIT 20
@@ -88,6 +88,7 @@ def reciprocal_rank_fusion(dense_list: List[asyncpg.Record], sparse_list: List[a
             if doc_id not in doc_data:
                 doc_data[doc_id] = {
                     "id": str(doc_id),
+                    "title": record.get("title") or "",
                     "content": record["content"],
                     "source": record["source"]
                 }
@@ -165,6 +166,9 @@ def init_db():
             );
         """)
         cur.execute("""
+            ALTER TABLE documents ADD COLUMN IF NOT EXISTS title TEXT;
+        """)
+        cur.execute("""
             ALTER TABLE documents ADD COLUMN IF NOT EXISTS fts_vector tsvector 
                 GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
         """)
@@ -211,10 +215,11 @@ def insert_document(doc: dict):
             
         cur.execute("""
             INSERT INTO documents (
-                source, content, embedding, department, clearance_level
-            ) VALUES (%s, %s, %s, %s, %s)
+                source, title, content, embedding, department, clearance_level
+            ) VALUES (%s, %s, %s, %s, %s, %s)
         """, (
             doc["source"],
+            doc.get("title", ""),
             doc["content"],
             emb,
             doc["department"],

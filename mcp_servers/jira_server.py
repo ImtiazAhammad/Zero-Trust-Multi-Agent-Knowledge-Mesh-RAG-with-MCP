@@ -241,15 +241,32 @@ async def search_jira(query: str, department: str) -> List[Dict]:
     Enforces RBAC department filters (user can only query tickets in their own department).
     """
     results = []
+    query_lower = query.lower()
+    
+    # Extract keywords (filtering out common short words and punctuation)
+    stop_words = {"how", "do", "i", "fix", "the", "in", "what", "are", "we", "have", "for", "new", "hires", "about", "recent", "is", "there", "any"}
+    keywords = [w.strip("?,.!") for w in query_lower.split()]
+    keywords = [w for w in keywords if w not in stop_words and len(w) > 2]
+    if not keywords:
+        keywords = [query_lower]
+
     for ticket in MOCK_JIRA_TICKETS:
         # Enforce RBAC department boundary
         if ticket["department"].lower() != department.lower():
             continue
             
-        # Search query check
-        if (query.lower() in ticket["title"].lower() or 
-            query.lower() in ticket["description"].lower() or 
-            query.lower() in ticket["ticket_id"].lower()):
+        # Match if query is direct substring or if any keyword matches
+        title_lower = ticket["title"].lower()
+        desc_lower = ticket["description"].lower()
+        id_lower = ticket["ticket_id"].lower()
+        
+        matches = (
+            query_lower in title_lower or 
+            query_lower in desc_lower or 
+            query_lower in id_lower or
+            any(kw in title_lower or kw in desc_lower or kw in id_lower for kw in keywords)
+        )
+        if matches:
             results.append(ticket)
             
     return results[:20]

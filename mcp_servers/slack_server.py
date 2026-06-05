@@ -126,6 +126,15 @@ async def search_slack(query: str, time_window_hours: int, department: str) -> L
     now = datetime.datetime.now(datetime.timezone.utc)
     cutoff_time = now - datetime.timedelta(hours=time_window_hours)
     
+    query_lower = query.lower()
+    
+    # Extract keywords (filtering out common short words and punctuation)
+    stop_words = {"how", "do", "i", "fix", "the", "in", "what", "are", "we", "have", "for", "new", "hires", "about", "recent", "is", "there", "any"}
+    keywords = [w.strip("?,.!") for w in query_lower.split()]
+    keywords = [w for w in keywords if w not in stop_words and len(w) > 2]
+    if not keywords:
+        keywords = [query_lower]
+
     results = []
     for msg in MOCK_SLACK_MESSAGES:
         # Enforce RBAC department bounds:
@@ -138,8 +147,16 @@ async def search_slack(query: str, time_window_hours: int, department: str) -> L
         if msg_time < cutoff_time:
             continue
             
-        # Keyword query check
-        if query.lower() in msg["text"].lower() or query.lower() in msg["channel"].lower():
+        # Match if query is direct substring or if any keyword matches
+        text_lower = msg["text"].lower()
+        chan_lower = msg["channel"].lower()
+        
+        matches = (
+            query_lower in text_lower or 
+            query_lower in chan_lower or
+            any(kw in text_lower or kw in chan_lower for kw in keywords)
+        )
+        if matches:
             results.append(msg)
             
     return results[:20]

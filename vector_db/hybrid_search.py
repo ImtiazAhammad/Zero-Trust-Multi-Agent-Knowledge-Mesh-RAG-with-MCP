@@ -10,7 +10,7 @@ from vector_db.embeddings import get_embedding
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/rag_db")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5433/rag_db")
 
 def get_connection():
     return psycopg2.connect(DATABASE_URL)

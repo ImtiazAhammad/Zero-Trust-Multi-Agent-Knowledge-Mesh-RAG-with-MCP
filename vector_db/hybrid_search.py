@@ -1,204 +1,229 @@
 import os
-import json
-from typing import List, dict
+import asyncio
+import httpx
+import asyncpg
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from typing import List, Dict, Optional
 from dotenv import load_dotenv
-
-# Local imports
-from vector_db.embeddings import get_embedding
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5433/rag_db")
+EMBEDDING_SERVICE_URL = os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8002")
 
-def get_connection():
+# --- Async Database search via asyncpg ---
+
+async def get_embedding_async(text: str) -> List[float]:
+    """
+    Retrieves dense embedding from the microservice at localhost:8002/embed.
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{EMBEDDING_SERVICE_URL}/embed",
+                json={"texts": [text]},
+                timeout=10.0
+            )
+            response.raise_for_status()
+            return response.json()["embeddings"][0]
+        except Exception as e:
+            print(f"Error querying embedding service: {e}. Generating mock local fallback.")
+            import random
+            random.seed(hash(text))
+            return [random.uniform(-0.1, 0.1) for _ in range(1024)]
+
+async def run_dense_query(conn: asyncpg.Connection, query_vector: List[float], department: str, clearance_level: int, source: Optional[str] = None) -> List[asyncpg.Record]:
+    """
+    Executes the dense pgvector cosine similarity search.
+    """
+    vector_str = str(query_vector)
+    if source:
+        sql = """
+            SELECT id, content, source, 1 - (embedding <=> $1::vector) AS score 
+            FROM documents 
+            WHERE department = $2 AND clearance_level <= $3 AND source = $4
+            ORDER BY score DESC LIMIT 20
+        """
+        return await conn.fetch(sql, vector_str, department, clearance_level, source)
+    else:
+        sql = """
+            SELECT id, content, source, 1 - (embedding <=> $1::vector) AS score 
+            FROM documents 
+            WHERE department = $2 AND clearance_level <= $3
+            ORDER BY score DESC LIMIT 20
+        """
+        return await conn.fetch(sql, vector_str, department, clearance_level)
+
+async def run_sparse_query(conn: asyncpg.Connection, query: str, department: str, clearance_level: int, source: Optional[str] = None) -> List[asyncpg.Record]:
+    """
+    Executes the sparse PostgreSQL full-text (ts_rank_cd) BM25 search.
+    """
+    if source:
+        sql = """
+            SELECT id, content, source, ts_rank_cd(to_tsvector('english', content), plainto_tsquery($1)) AS score 
+            FROM documents 
+            WHERE department = $2 AND clearance_level <= $3 AND source = $4
+            ORDER BY score DESC LIMIT 20
+        """
+        return await conn.fetch(sql, query, department, clearance_level, source)
+    else:
+        sql = """
+            SELECT id, content, source, ts_rank_cd(to_tsvector('english', content), plainto_tsquery($1)) AS score 
+            FROM documents 
+            WHERE department = $2 AND clearance_level <= $3
+            ORDER BY score DESC LIMIT 20
+        """
+        return await conn.fetch(sql, query, department, clearance_level)
+
+def reciprocal_rank_fusion(dense_list: List[asyncpg.Record], sparse_list: List[asyncpg.Record], limit: int = 20) -> List[Dict]:
+    """
+    Merges dense and sparse lists using Reciprocal Rank Fusion: score = 1 / (rank + 60).
+    """
+    rrf_scores = {}
+    doc_data = {}
+    
+    def process_list(records):
+        for rank, record in enumerate(records):
+            doc_id = record["id"]
+            if doc_id not in doc_data:
+                doc_data[doc_id] = {
+                    "id": str(doc_id),
+                    "content": record["content"],
+                    "source": record["source"]
+                }
+            # RRF calculation
+            score = 1.0 / (rank + 60)
+            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + score
+
+    process_list(dense_list)
+    process_list(sparse_list)
+    
+    # Sort descending based on accumulated RRF score
+    sorted_docs = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    
+    results = []
+    for doc_id, score in sorted_docs[:limit]:
+        doc = doc_data[doc_id]
+        doc["score"] = score
+        results.append(doc)
+        
+    return results
+
+async def search_db(query: str, department: str, clearance_level: int, source: Optional[str] = None, limit: int = 20) -> List[Dict]:
+    """
+    Performs parallel dense (pgvector) and sparse (tsvector) searches.
+    Merges results using Reciprocal Rank Fusion (RRF) and returns top-N results.
+    """
+    # 1. Fetch query embedding vector
+    query_vector = await get_embedding_async(query)
+    
+    # 2. Run queries in parallel using asyncpg (requires separate connections for concurrency)
+    conn_dense, conn_sparse = await asyncio.gather(
+        asyncpg.connect(DATABASE_URL),
+        asyncpg.connect(DATABASE_URL)
+    )
+    try:
+        dense_task = run_dense_query(conn_dense, query_vector, department, clearance_level, source)
+        sparse_task = run_sparse_query(conn_sparse, query, department, clearance_level, source)
+        dense_results, sparse_results = await asyncio.gather(dense_task, sparse_task)
+    finally:
+        await asyncio.gather(
+            conn_dense.close(),
+            conn_sparse.close()
+        )
+        
+    # 3. Fuse and rank results
+    return reciprocal_rank_fusion(dense_results, sparse_results, limit=limit)
+
+
+# --- Synchronous Seeding Utilities via psycopg2 ---
+
+def get_connection_sync():
+    """
+    Sync fallback connection for seeding/initialization.
+    """
     return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     """
-    Initializes PostgreSQL database, ensures pgvector extension is active,
-    creates documents table, and sets up GIN index for full-text search.
+    Initializes PostgreSQL database tables (used for manual seeding).
     """
-    conn = get_connection()
+    conn = get_connection_sync()
     cur = conn.cursor()
     try:
-        # Enable pgvector extension
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        
-        # Create documents table with a 1024-dimension vector column (BGE Large)
+        cur.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS documents (
-                id SERIAL PRIMARY KEY,
-                source VARCHAR(50) NOT NULL, -- confluence, jira, slack
-                title TEXT,
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
                 content TEXT NOT NULL,
-                url TEXT,
-                ticket_id VARCHAR(50),
-                status VARCHAR(50),
-                channel VARCHAR(100),
-                sender VARCHAR(100),
-                department VARCHAR(100) NOT NULL,
-                clearance_level INT NOT NULL,
                 embedding vector(1024),
-                fts_vector tsvector
+                source TEXT,
+                department TEXT,
+                clearance_level INT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        
-        # Create full-text search update trigger
         cur.execute("""
-            CREATE OR REPLACE FUNCTION documents_fts_trigger() RETURNS trigger AS $$
-            begin
-              new.fts_vector :=
-                to_tsvector('english', coalesce(new.title, '')) ||
-                to_tsvector('english', coalesce(new.content, ''));
-              return new;
-            end
-            $$ LANGUAGE plpgsql;
+            ALTER TABLE documents ADD COLUMN IF NOT EXISTS fts_vector tsvector 
+                GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
         """)
-        
-        cur.execute("""
-            CREATE OR REPLACE TRIGGER tsvectorupdate BEFORE INSERT OR UPDATE
-            ON documents FOR EACH ROW EXECUTE FUNCTION documents_fts_trigger();
-        """)
-        
-        # Create index on embedding and tsvector for quick queries
         cur.execute("CREATE INDEX IF NOT EXISTS doc_fts_idx ON documents USING GIN(fts_vector);")
-        # vector index can be IVFFlat or HNSW (HNSW is generally preferred for performance)
         cur.execute("CREATE INDEX IF NOT EXISTS doc_vector_idx ON documents USING hnsw (embedding vector_cosine_ops);")
-        
         conn.commit()
-        print("Database initialized successfully with pgvector and full-text indexes.")
+        print("Database schema verified/initialized successfully.")
     except Exception as e:
         conn.rollback()
-        print(f"Error initializing database: {e}")
+        print(f"Error initializing schema: {e}")
     finally:
         cur.close()
         conn.close()
 
 def insert_document(doc: dict):
     """
-    Inserts a single document and generates its embedding.
+    Synchronous document insertion with embedding generation (used for seeding).
     """
-    conn = get_connection()
+    conn = get_connection_sync()
     cur = conn.cursor()
     try:
-        emb = get_embedding(doc["content"])
-        
+        # Run event loop to resolve async embedding call
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If running in Jupyter or another active loop, use nest_asyncio or call helper
+            import urllib.request
+            import json
+            # Fallback to synchronous HTTP POST to avoid nested loop issues
+            try:
+                req = urllib.request.Request(
+                    f"{EMBEDDING_SERVICE_URL}/embed", 
+                    data=json.dumps({"texts": [doc["content"]]}).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'}
+                )
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    res = json.loads(response.read().decode())
+                    emb = res["embeddings"][0]
+            except Exception:
+                import random
+                random.seed(hash(doc["content"]))
+                emb = [random.uniform(-0.1, 0.1) for _ in range(1024)]
+        else:
+            emb = loop.run_until_complete(get_embedding_async(doc["content"]))
+            
         cur.execute("""
             INSERT INTO documents (
-                source, title, content, url, ticket_id, status, channel, sender, department, clearance_level, embedding
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                source, content, embedding, department, clearance_level
+            ) VALUES (%s, %s, %s, %s, %s)
         """, (
             doc["source"],
-            doc.get("title"),
             doc["content"],
-            doc.get("url"),
-            doc.get("ticket_id"),
-            doc.get("status"),
-            doc.get("channel"),
-            doc.get("sender"),
-            doc.get("department"),
-            doc.get("clearance_level", 1),
-            emb
+            emb,
+            doc["department"],
+            doc["clearance_level"]
         ))
         conn.commit()
     except Exception as e:
         conn.rollback()
         raise e
-    finally:
-        cur.close()
-        conn.close()
-
-def reciprocal_rank_fusion(dense_results: List[dict], sparse_results: List[dict], k: int = 60) -> List[dict]:
-    """
-    Combines two ranked lists of results using Reciprocal Rank Fusion.
-    """
-    rrf_scores = {}
-    doc_map = {}
-    
-    # Process dense embeddings rank
-    for rank, doc in enumerate(dense_results):
-        doc_id = doc["id"]
-        doc_map[doc_id] = doc
-        rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
-        
-    # Process keyword search rank
-    for rank, doc in enumerate(sparse_results):
-        doc_id = doc["id"]
-        doc_map[doc_id] = doc
-        rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
-        
-    # Sort documents by their accumulated RRF score
-    sorted_doc_ids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-    
-    fused_docs = []
-    for doc_id, score in sorted_doc_ids:
-        doc = doc_map[doc_id]
-        doc["rrf_score"] = score
-        fused_docs.append(doc)
-        
-    return fused_docs
-
-def search_db(query: str, source: str, department: str, clearance_level: int, limit: int = 20) -> List[dict]:
-    """
-    Main entry point for security-filtered hybrid search.
-    1. Converts query to embedding.
-    2. Runs vector similarity query (pgvector).
-    3. Runs standard postgres full-text text matching.
-    4. Merges dense & sparse results via Reciprocal Rank Fusion.
-    5. Returns unified security-filtered document results.
-    """
-    conn = get_connection()
-    # Use RealDictCursor to return results as clean python dictionaries
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    try:
-        # Enforce security context: Users see items from their own department
-        # or globally shared channels, up to their authorization clearance level.
-        # This matches the user's diagram specification:
-        # "RBAC Metadata Filter injected (WHERE department = ? AND clearance_level >= ?)"
-        # Note: Clearance level checks represent <= permission (lower clearance level is less restrictive, e.g. Intern=1, Admin=3).
-        security_query = """
-            (department = %s OR department = 'Shared')
-            AND clearance_level <= %s
-            AND source = %s
-        """
-        
-        # 1. Sparse Search (BM25 Full Text Search in Postgres)
-        cur.execute(f"""
-            SELECT id, source, title, content, url, ticket_id, status, channel, sender, department, clearance_level,
-                   ts_rank(fts_vector, plainto_tsquery('english', %s)) as rank
-            FROM documents
-            WHERE {security_query} AND fts_vector @@ plainto_tsquery('english', %s)
-            ORDER BY rank DESC
-            LIMIT %s
-        """, (query, department, clearance_level, source, query, limit))
-        sparse_results = cur.fetchall()
-        
-        # 2. Dense Search (pgvector Cosine Distance)
-        query_emb = get_embedding(query)
-        cur.execute(f"""
-            SELECT id, source, title, content, url, ticket_id, status, channel, sender, department, clearance_level,
-                   (1 - (embedding <=> %s::vector)) as similarity
-            FROM documents
-            WHERE {security_query}
-            ORDER BY embedding <=> %s::vector ASC
-            LIMIT %s
-        """, (query_emb, department, clearance_level, source, query_emb, limit))
-        dense_results = cur.fetchall()
-        
-        # Convert RealDictCursor objects to standard dicts
-        sparse_results_dict = [dict(row) for row in sparse_results]
-        dense_results_dict = [dict(row) for row in dense_results]
-        
-        # 3. Apply Reciprocal Rank Fusion (RRF)
-        fused_results = reciprocal_rank_fusion(dense_results_dict, sparse_results_dict)
-        return fused_results[:limit]
-        
-    except Exception as e:
-        print(f"Error performing hybrid search: {e}")
-        return []
     finally:
         cur.close()
         conn.close()

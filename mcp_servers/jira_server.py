@@ -4,7 +4,7 @@ from vector_db.hybrid_search import search_db
 mcp = FastMCP("Jira Server")
 
 @mcp.tool()
-def search_jira(query: str, department: str, clearance_level: int) -> str:
+async def search_jira(query: str, department: str, clearance_level: int) -> str:
     """
     Searches mock Jira tickets, task descriptions, and bugs.
     Enforces document-level RBAC by filtering results with department and clearance level.
@@ -12,7 +12,7 @@ def search_jira(query: str, department: str, clearance_level: int) -> str:
     try:
         # Query the hybrid search engine, explicitly restricting source to 'jira'
         # and passing security contexts.
-        results = search_db(
+        results = await search_db(
             query=query,
             source="jira",
             department=department,

@@ -4,7 +4,7 @@ from vector_db.hybrid_search import search_db
 mcp = FastMCP("Slack Server")
 
 @mcp.tool()
-def search_slack(query: str, department: str, clearance_level: int) -> str:
+async def search_slack(query: str, department: str, clearance_level: int) -> str:
     """
     Searches mock Slack channel logs, team chat discussions, and messages.
     Enforces document-level RBAC by filtering results with department and clearance level.
@@ -12,7 +12,7 @@ def search_slack(query: str, department: str, clearance_level: int) -> str:
     try:
         # Query the hybrid search engine, explicitly restricting source to 'slack'
         # and passing security contexts.
-        results = search_db(
+        results = await search_db(
             query=query,
             source="slack",
             department=department,

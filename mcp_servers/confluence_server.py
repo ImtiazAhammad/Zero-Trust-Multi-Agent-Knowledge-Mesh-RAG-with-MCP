@@ -4,7 +4,7 @@ from vector_db.hybrid_search import search_db
 mcp = FastMCP("Confluence Server")
 
 @mcp.tool()
-def search_confluence(query: str, department: str, clearance_level: int) -> str:
+async def search_confluence(query: str, department: str, clearance_level: int) -> str:
     """
     Searches mock Confluence wiki pages and documentation.
     Enforces document-level RBAC by filtering results with department and clearance level.
@@ -12,7 +12,7 @@ def search_confluence(query: str, department: str, clearance_level: int) -> str:
     try:
         # Query the hybrid search engine, explicitly restricting source to 'confluence'
         # and passing security contexts.
-        results = search_db(
+        results = await search_db(
             query=query,
             source="confluence",
             department=department,

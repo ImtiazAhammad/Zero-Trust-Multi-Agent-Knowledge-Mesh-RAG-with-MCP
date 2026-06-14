@@ -1,52 +1,86 @@
-import os
-from datetime import datetime, timedelta
-from jose import JWTError, jwt
-from fastapi import HTTPException, status
-from dotenv import load_dotenv
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from jose import jwt, JWTError
 
-load_dotenv()
+SECRET_KEY = "enterprise-secret"
+ALGORITHM = "HS256"
 
-JWT_SECRET = os.getenv("JWT_SECRET", "supersecretjwtkeyforzerotrustragpipelinethatshouldbelong")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+# Role mapping configuration
+ROLE_CLEARANCE_MAP = {
+    "HR_Director": 3,
+    "Engineering_Lead": 3,
+    "Marketing_Manager": 2,
+    "Marketing_Intern": 1,
+    "Finance_Analyst": 2
+}
 
-def create_access_token(data: dict, expires_delta: timedelta = None) -> str:
-    """
-    Generates a JWT access token containing security claims.
-    """
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return encoded_jwt
+ROLE_DEPARTMENT_MAP = {
+    "HR_Director": "HR",
+    "Engineering_Lead": "Engineering",
+    "Marketing_Manager": "Marketing",
+    "Marketing_Intern": "Marketing",
+    "Finance_Analyst": "Finance"
+}
 
-def get_current_user(token: str) -> dict:
-    """
-    Decodes the JWT token and extracts user permissions (department, clearance_level).
-    Raises HTTPException (401 Unauthorized) if token validation fails.
-    """
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        username: str = payload.get("sub")
-        department: str = payload.get("department")
-        clearance_level: int = payload.get("clearance_level")
-        
-        if username is None or department is None or clearance_level is None:
-            raise credentials_exception
+class RBACMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Exclude common system/utility paths
+        if request.url.path in ["/health", "/docs", "/redoc", "/openapi.json"]:
+            return await call_next(request)
             
-        return {
-            "username": username,
-            "department": department,
-            "clearance_level": clearance_level
-        }
-    except JWTError:
-        raise credentials_exception
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing or invalid Authorization header"}
+            )
+            
+        token = auth_header.split(" ")[1]
+        try:
+            # Decode JWT
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            role = payload.get("role")
+            department = payload.get("department")
+            
+            if not role or not department:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid token payload: missing role or department"}
+                )
+                
+            if role not in ROLE_CLEARANCE_MAP:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": f"Unauthorized role: {role}"}
+                )
+                
+            # Map role to clearance level dynamically as per requirements
+            clearance_level = ROLE_CLEARANCE_MAP[role]
+            
+            # Attach rbac_context to request.state
+            request.state.rbac_context = {
+                "department": department,
+                "clearance_level": clearance_level
+            }
+        except JWTError:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or expired token"}
+            )
+            
+        return await call_next(request)
+
+def generate_mock_token(role: str) -> str:
+    """
+    Generates a valid mock JWT token for a given role with its associated department and clearance level.
+    """
+    dep = ROLE_DEPARTMENT_MAP.get(role, "Engineering")
+    clearance = ROLE_CLEARANCE_MAP.get(role, 1)
+    
+    payload = {
+        "role": role,
+        "department": dep,
+        "clearance_level": clearance
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)

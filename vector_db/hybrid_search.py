@@ -110,13 +110,16 @@ def reciprocal_rank_fusion(dense_list: List[asyncpg.Record], sparse_list: List[a
         
     return results
 
-async def search_db(query: str, department: str, clearance_level: int, source: Optional[str] = None, limit: int = 20) -> List[Dict]:
+async def search_db(query: str, department: str, clearance_level: int, source: Optional[str] = None, limit: int = 20, hyde_vector: Optional[List[float]] = None) -> List[Dict]:
     """
     Performs parallel dense (pgvector) and sparse (tsvector) searches.
     Merges results using Reciprocal Rank Fusion (RRF) and returns top-N results.
     """
-    # 1. Fetch query embedding vector
-    query_vector = await get_embedding_async(query)
+    # 1. Fetch dense query vector (use precomputed hyde_vector if provided)
+    if hyde_vector is not None:
+        query_vector = hyde_vector
+    else:
+        query_vector = await get_embedding_async(query)
     
     # 2. Run queries in parallel using asyncpg (requires separate connections for concurrency)
     conn_dense, conn_sparse = await asyncio.gather(

@@ -20,7 +20,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localho
 mcp = FastMCP("confluence-mcp")
 
 @mcp.tool()
-async def search_confluence(query: str, department: str, clearance_level: int) -> List[Dict]:
+async def search_confluence(query: str, department: str, clearance_level: int, hyde_vector: List[float] = None) -> List[Dict]:
     """
     Searches mock Confluence wiki pages and documentation.
     Applies RBAC filters (department, clearance_level), runs parallel hybrid search, 
@@ -33,7 +33,8 @@ async def search_confluence(query: str, department: str, clearance_level: int) -
             department=department,
             clearance_level=clearance_level,
             source="confluence",
-            limit=20
+            limit=20,
+            hyde_vector=hyde_vector
         )
         # 2. Rerank using the cross-encoder and return top-5
         top_five = rerank(query, hybrid_results)
